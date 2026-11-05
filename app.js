@@ -50,8 +50,26 @@ const cardTitle = document.getElementById("card-title");
 // 카드가 들어갈 자리
 const cardList = document.getElementById("card-list");
 
+// 지도 영역
+const mapSection = document.getElementById("map-section");
+// 지도를 그릴 상자
+const mapBox = document.getElementById("map");
+// 지도 좌표 없음 문구
+const mapEmpty = document.getElementById("map-empty");
+
 // 지금 그려져 있는 그래프 (지역을 바꿀 때 지우기 위해 저장)
 let pm10Chart = null;
+
+// Leaflet 지도 (처음 한 번만 만든다)
+let map = null;
+// 측정소 동그라미들을 담는 묶음
+let markerLayer = null;
+// 오른쪽 아래 '몇 시 기준' 글자 상자
+let mapTimeBox = null;
+// 확대했을 때만 수치 글자를 보일지 (전국일 때 참)
+let labelsOnlyWhenZoomed = false;
+// 이 확대 단계 이상이면 전국에서도 수치 글자를 보여준다
+const LABEL_ZOOM = 10;
 
 // 드롭다운에 시도 목록을 채운다
 function fillSidoOptions() {
@@ -152,8 +170,8 @@ async function fetchAirData(sidoName) {
   }
   // 서버가 보낸 한국어 오류 메시지가 있으면 그대로 보여준다
   if (!response.ok || data.error) throw new Error(data.error || `서버 응답 오류가 발생했습니다 (${response.status})`);
-  // 측정소 목록을 돌려준다 (없으면 빈 배열)
-  return data.items ?? [];
+  // 측정소 목록과 좌표 조회 성공 여부를 돌려준다
+  return { items: data.items ?? [], stationsOk: data.stationsOk !== false };
 }
 
 // 신호등 상자의 등급 색을 바꾼다
@@ -190,6 +208,12 @@ function resetSignal(regionText, labelText = "대기 중") {
   signalDetail.textContent = "";
 }
 
+// 측정소들 중 가장 최근 측정 시각(원래 글자)을 찾는다 (없으면 null)
+function getLatestTime(items) {
+  // 읽을 수 있는 시각만 골라 최신순으로 정렬한 뒤 첫 번째를 돌려준다
+  return items.map((item) => item.dataTime).filter((t) => parseDataTime(t)).sort((a, b) => parseDataTime(b) - parseDataTime(a))[0] || null;
+}
+
 // 평균을 계산해서 공기 신호등을 그린다
 function showSignal(sidoName, items) {
   // 숫자로 쓸 수 있는 미세먼지 값만 모은다 ("-"는 빠짐)
@@ -208,7 +232,7 @@ function showSignal(sidoName, items) {
   // 평균에 맞는 대표 등급 정보를 가져온다
   const info = GRADE_INFO[gradeFromPm10(avg)];
   // 가장 최근 측정 시각을 찾는다
-  const latest = items.map((item) => item.dataTime).filter((t) => parseDataTime(t)).sort((a, b) => parseDataTime(b) - parseDataTime(a))[0];
+  const latest = getLatestTime(items);
   // 신호등 색을 바꾼다
   setSignalGrade(info.className);
   // 지역 줄
@@ -341,6 +365,146 @@ function renderChart(items, isNationwide) {
   });
 }
 
+// 지도를 처음 한 번만 만든다
+function ensureMap() {
+  // 이미 있으면 그대로 쓴다
+  if (map) return;
+  // 지도를 만든다 (출처 표기는 왼쪽 아래로 옮기기 위해 기본 것은 끈다)
+  map = L.map(mapBox, { attributionControl: false });
+  // OpenStreetMap 지도 그림을 깐다
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 18 }).addTo(map);
+  // 왼쪽 아래에 지도 출처를 표시한다
+  L.control.attribution({ position: "bottomleft", prefix: false })
+    .addAttribution('&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> 기여자') // 출처 문구
+    .addTo(map); // 지도에 붙인다
+  // 오른쪽 아래 '몇 시 기준' 상자를 만드는 틀
+  const TimeControl = L.Control.extend({
+    // 위치는 오른쪽 아래
+    options: { position: "bottomright" },
+    // 지도에 붙을 때 글자 상자를 만든다
+    onAdd() { return L.DomUtil.create("div", "map-time"); },
+  });
+  // 틀로 상자를 만들어 지도에 붙인다
+  const timeControl = new TimeControl().addTo(map);
+  // 글자를 바꿀 수 있게 상자를 저장한다
+  mapTimeBox = timeControl.getContainer();
+  // 측정소 동그라미 묶음을 지도에 붙인다
+  markerLayer = L.layerGroup().addTo(map);
+  // 확대·축소할 때마다 수치 글자를 보일지 다시 정한다
+  map.on("zoomend", updateLabelVisibility);
+}
+
+// 확대 정도에 따라 수치 글자를 보이거나 숨긴다
+function updateLabelVisibility() {
+  // 지도가 없으면 할 일 없음
+  if (!map) return;
+  // 전국이면서 멀리 볼 때만 숨긴다
+  const hide = labelsOnlyWhenZoomed && map.getZoom() < LABEL_ZOOM;
+  // 지도 상자에 숨김 표시를 붙이거나 뗀다
+  mapBox.classList.toggle("hide-labels", hide);
+}
+
+// 지도 위 측정소 표시를 지우고 지도 영역을 숨긴다
+function clearMap() {
+  // 동그라미들을 모두 지운다
+  if (markerLayer) markerLayer.clearLayers();
+  // 지도 영역 숨기기
+  mapSection.hidden = true;
+}
+
+// 측정소 말풍선 내용을 만든다 (글자는 textContent로 넣어 안전하게)
+function createPopup(item, isNationwide, info) {
+  // 말풍선 상자
+  const box = document.createElement("div");
+  // 말풍선 모양 지정
+  box.className = "map-popup";
+  // 측정소 이름
+  const title = document.createElement("strong");
+  // 이름 넣기
+  title.textContent = stationLabel(item, isNationwide);
+  // 상자에 이름 붙이기
+  box.append(title);
+  // 등급, 두 수치, 측정 시각을 한 줄씩 붙인다
+  [`${info.emoji} ${info.label}`, `미세먼지: ${formatValue(item.pm10Value)}`, `초미세먼지: ${formatValue(item.pm25Value)}`, formatKoreanTime(item.dataTime)].forEach((text) => {
+    // 한 줄 만들기
+    const line = document.createElement("div");
+    // 글자 넣기
+    line.textContent = text;
+    // 상자에 붙이기
+    box.append(line);
+  });
+  // 완성된 말풍선 내용을 돌려준다
+  return box;
+}
+
+// 측정소들을 지도 위에 등급 색 동그라미와 수치로 표시한다
+function renderMap(items, isNationwide, stationsOk) {
+  // 이전 표시를 지운다
+  clearMap();
+  // 지도 영역을 보이게 한다
+  mapSection.hidden = false;
+  // 좌표가 있는 측정소만 고른다
+  const points = items.filter((item) => Number.isFinite(item.lat) && Number.isFinite(item.lng));
+  // Leaflet을 못 불러왔거나 좌표가 하나도 없으면 안내만 한다
+  if (typeof L === "undefined" || points.length === 0) {
+    // 지도 상자 숨기기
+    mapBox.hidden = true;
+    // 안내 문구 보이기
+    mapEmpty.hidden = false;
+    // 상황에 맞는 문구를 넣는다
+    mapEmpty.textContent = typeof L === "undefined"
+      ? "지도 도구를 불러오지 못했어요"
+      : stationsOk
+        ? "이 지역 측정소의 위치를 찾지 못했어요"
+        : "측정소 위치 정보를 불러오지 못했어요 (측정소정보 API 활용신청을 확인해 주세요)";
+    // 여기서 끝낸다
+    return;
+  }
+  // 지도 상자 보이기
+  mapBox.hidden = false;
+  // 안내 문구 숨기기
+  mapEmpty.hidden = true;
+  // 지도를 (처음이면) 만든다
+  ensureMap();
+  // 숨겨졌다 나타난 상자 크기를 지도에 다시 알려준다
+  map.invalidateSize();
+  // 측정소마다 동그라미를 만든다
+  points.forEach((item) => {
+    // 등급 정보를 가져온다
+    const info = getGradeInfo(item.pm10Grade);
+    // 미세먼지 수치 (없으면 "-")
+    const pm10 = toNumber(item.pm10Value) ?? "-";
+    // 초미세먼지 수치 (없으면 "-")
+    const pm25 = toNumber(item.pm25Value) ?? "-";
+    // 등급 색 동그라미를 만든다
+    L.circleMarker([item.lat, item.lng], {
+      radius: 9,              // 동그라미 크기
+      color: "#ffffff",       // 테두리는 흰색
+      weight: 2,              // 테두리 두께
+      fillColor: info.color,  // 안쪽은 등급 색
+      fillOpacity: 0.9,       // 안쪽 진하기
+    })
+      .bindTooltip(`미세 ${pm10} · 초미세 ${pm25}`, {
+        permanent: true,                            // 항상 보이게
+        direction: "right",                         // 동그라미 오른쪽에
+        offset: [10, 0],                            // 살짝 띄워서
+        className: `map-label ${info.className}`,   // 등급 색 테두리
+      })
+      .bindPopup(createPopup(item, isNationwide, info)) // 누르면 자세한 정보
+      .addTo(markerLayer); // 묶음에 넣는다
+  });
+  // 모든 측정소가 보이도록 지도를 맞춘다
+  map.fitBounds(L.latLngBounds(points.map((p) => [p.lat, p.lng])), { padding: [30, 30], maxZoom: 12 });
+  // 전국이면 확대했을 때만 수치 글자를 보이게 한다
+  labelsOnlyWhenZoomed = isNationwide;
+  // 지금 확대 정도에 맞춰 글자를 보이거나 숨긴다
+  updateLabelVisibility();
+  // 가장 최근 측정 시각을 찾는다
+  const latest = getLatestTime(items);
+  // 오른쪽 아래에 '몇 시 기준'을 표시한다
+  mapTimeBox.textContent = latest ? formatKoreanTime(latest) : "측정 시각 정보 없음";
+}
+
 // 측정소 하나로 카드 하나를 만든다
 function createCard(item, isNationwide) {
   // 등급에 맞는 정보를 가져온다
@@ -429,6 +593,8 @@ async function loadSido(sidoName) {
   clearCards();
   // 기존 그래프를 지운다
   clearChart();
+  // 기존 지도 표시를 지운다
+  clearMap();
   // 안내 문구 비우기
   setStatus("");
   // 아무 것도 안 골랐으면 처음 상태로
@@ -445,7 +611,7 @@ async function loadSido(sidoName) {
   // 요청 중 오류가 나도 화면이 멈추지 않게 감싼다
   try {
     // 서버에서 데이터를 받아온다
-    const items = await fetchAirData(sidoName);
+    const { items, stationsOk } = await fetchAirData(sidoName);
     // 불러오는 중을 끝낸다 (그래프는 보이는 상태에서 그려야 크기가 맞는다)
     setLoading(false);
     // 데이터가 없으면 안내만 한다
@@ -459,6 +625,8 @@ async function loadSido(sidoName) {
     }
     // 공기 신호등을 그린다
     showSignal(sidoName, items);
+    // 측정소 지도를 그린다
+    renderMap(items, isNationwide, stationsOk);
     // 막대그래프를 그린다
     renderChart(items, isNationwide);
     // 카드 제목 보이기
